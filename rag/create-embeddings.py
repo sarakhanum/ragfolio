@@ -95,7 +95,11 @@ def compute_embeddings(chunks: List[str]) -> List[List[float]]:
 def save_to_vector_store(chunks: List[str], embeddings: List[List[float]]) -> None:
     """Clear existing data and save new embeddings to ChromaDB."""
     os.makedirs(CHROMA_DB_DIR, exist_ok=True)
-    client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+    from chromadb.config import Settings
+    client = chromadb.PersistentClient(
+        path=CHROMA_DB_DIR, 
+        settings=Settings(anonymized_telemetry=False)
+    )
 
     # Safely clear the collection by deleting and recreating it
     try:
