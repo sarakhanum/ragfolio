@@ -3,23 +3,28 @@ from typing import Iterable, List, Tuple
 
 import chromadb
 from fastembed import TextEmbedding
+from chromadb.config import Settings
 
-# The pre-trained model used to convert text into numerical vectors.
+# PDF support
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+
+# ---------------- CONFIG ---------------- #
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
-# The local directory where the vector database is stored.
 CHROMA_DB_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
-# The name of the collection within ChromaDB to store resume data.
 COLLECTION_NAME = "resume_chunks"
-# Directory containing source documents to embed.
 INPUT_DATA_DIR = os.path.join(os.path.dirname(__file__), "input-data")
-# The number of text chunks processed at once during embedding.
 ENCODE_BATCH_SIZE = 32
-# The number of vectors saved to the database in a single transaction.
 DB_ADD_BATCH_SIZE = 100
+# ---------------------------------------- #
 
 
+# ---------------- TEXT CHUNKING ---------------- #
 def chunk_text(text: str, max_chars: int = 500) -> List[str]:
-    """Split the input text into semantically coherent chunks."""
+    """Splits text into smaller chunks for embedding."""
     text = text.strip()
     if not text:
         return []
@@ -28,7 +33,7 @@ def chunk_text(text: str, max_chars: int = 500) -> List[str]:
     chunks: List[str] = []
     current = ""
 
-    def flush_current():
+    def flush():
         nonlocal current
         if current.strip():
             chunks.append(current.strip())
@@ -39,157 +44,168 @@ def chunk_text(text: str, max_chars: int = 500) -> List[str]:
         if not para:
             continue
 
-        if len(current) + len(para) + 2 > max_chars:
-            if len(para) > max_chars:
-                lines = para.split("\n")
-                for line in lines:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if len(current) + len(line) + 1 > max_chars:
-                        flush_current()
-                    current = (current + " " + line).strip()
-                flush_current()
-            else:
-                flush_current()
-                current = para
+        if len(current) + len(para) > max_chars:
+            flush()
+            current = para
         else:
-            if current:
-                current = current + "\n\n" + para
-            else:
-                current = para
+            current += "\n\n" + para if current else para
 
-    flush_current()
+    flush()
     return chunks
+# ------------------------------------------------ #
+
+
+# ---------------- FILE READING ---------------- #
+def read_txt(file_path: str) -> str:
+    with open(file_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def read_pdf(file_path: str) -> str:
+    if PyPDF2 is None:
+        print(f"⚠️ PyPDF2 not installed, skipping PDF: {file_path}")
+        return ""
+
+    text = ""
+    try:
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                text += page.extract_text() or ""
+    except Exception as e:
+        print(f"⚠️ Error reading PDF {file_path}: {e}")
+
+    return text
+
+
+def read_file(file_path: str) -> str:
+    if file_path.endswith(".txt") or file_path.endswith(".md"):
+        return read_txt(file_path)
+    elif file_path.endswith(".pdf"):
+        return read_pdf(file_path)
+    else:
+        print(f"⚠️ Unsupported file skipped: {file_path}")
+        return ""
+# ------------------------------------------------ #
 
 
 def _iter_input_files(input_dir: str) -> Iterable[str]:
     if not os.path.isdir(input_dir):
-        raise FileNotFoundError(f"Could not find input directory at {input_dir}")
+        raise FileNotFoundError(f"❌ Input directory not found: {input_dir}")
 
-    for root, _dirs, files in os.walk(input_dir):
-        for name in sorted(files):
-            path = os.path.join(root, name)
-            if os.path.isfile(path):
-                yield path
+    for root, _, files in os.walk(input_dir):
+        for name in files:
+            yield os.path.join(root, name)
 
 
+# ---------------- LOAD DATA ---------------- #
 def load_input_chunks(input_dir: str) -> Tuple[List[str], List[dict]]:
-    """Read all files in input_dir and return (chunks, metadatas)."""
     all_chunks: List[str] = []
     all_metadatas: List[dict] = []
 
-    input_dir_abs = os.path.abspath(input_dir)
-    files = list(_iter_input_files(input_dir_abs))
+    input_dir = os.path.abspath(input_dir)
+    files = list(_iter_input_files(input_dir))
+
     if not files:
-        raise ValueError(f"No files found under {input_dir_abs}")
+        raise ValueError(f"❌ No files found in: {input_dir}")
 
-    total_chars = 0
     for file_path in files:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            # Skip binary/unknown encodings to avoid poisoning the store
+        text = read_file(file_path)
+
+        if not text.strip():
+            print(f"⚠️ Empty file skipped: {file_path}")
             continue
 
-        total_chars += len(text)
-        file_chunks = chunk_text(text, max_chars=500)
-        if not file_chunks:
+        chunks = chunk_text(text)
+
+        if not chunks:
+            print(f"⚠️ No chunks created from: {file_path}")
             continue
 
-        rel_source = os.path.relpath(file_path, input_dir_abs)
-        for i, chunk in enumerate(file_chunks):
+        rel_source = os.path.relpath(file_path, input_dir)
+
+        for i, chunk in enumerate(chunks):
             all_chunks.append(chunk)
-            all_metadatas.append(
-                {
-                    "source": rel_source,
-                    "chunk_index": i,
-                }
-            )
+            all_metadatas.append({
+                "source": rel_source,
+                "chunk_index": i
+            })
 
     if not all_chunks:
-        raise ValueError(f"No text chunks were created from files under {input_dir_abs}")
+        raise ValueError("❌ No valid text chunks created. Add proper text files.")
 
-    print(
-        f"Loaded input-data: {len(files)} files, {total_chars} characters, {len(all_chunks)} chunks."
-    )
+    print(f"✅ Loaded {len(files)} files → {len(all_chunks)} chunks")
     return all_chunks, all_metadatas
+# ------------------------------------------------ #
 
 
+# ---------------- EMBEDDINGS ---------------- #
 def compute_embeddings(chunks: List[str]) -> List[List[float]]:
-    """Convert text chunks into numerical embedding vectors."""
+    """Generate embeddings for text chunks."""
     model = TextEmbedding(model_name=EMBEDDING_MODEL_NAME)
-    all_embeddings: List[List[float]] = []
+    embeddings: List[List[float]] = []
 
-    print("Computing embeddings in batches...")
-    for start in range(0, len(chunks), ENCODE_BATCH_SIZE):
-        batch = chunks[start : start + ENCODE_BATCH_SIZE]
+    print("🔄 Generating embeddings...")
+    for i in range(0, len(chunks), ENCODE_BATCH_SIZE):
+        batch = chunks[i:i + ENCODE_BATCH_SIZE]
         for emb in model.embed(batch):
-            all_embeddings.append(emb.tolist())
-        print(f"  Encoded {min(start + ENCODE_BATCH_SIZE, len(chunks))}/{len(chunks)} chunks")
+            embeddings.append(emb.tolist())
 
-    return all_embeddings
+    print("✅ Embeddings created")
+    return embeddings
+# ------------------------------------------------ #
 
 
-def save_to_vector_store(
-    chunks: List[str], embeddings: List[List[float]], metadatas: List[dict]
-) -> None:
-    """Clear existing data and save new embeddings to ChromaDB."""
+# ---------------- SAVE TO DB ---------------- #
+def save_to_vector_store(chunks, embeddings, metadatas):
+    # ✅ CRITICAL CHECK (Issue 15 fix)
     if len(chunks) != len(embeddings) or len(chunks) != len(metadatas):
-        raise ValueError("chunks/embeddings/metadatas must be the same length")
+        raise ValueError("Mismatch between chunks, embeddings, and metadata lengths")
 
     os.makedirs(CHROMA_DB_DIR, exist_ok=True)
-    from chromadb.config import Settings
+
     client = chromadb.PersistentClient(
-        path=CHROMA_DB_DIR, 
+        path=CHROMA_DB_DIR,
         settings=Settings(anonymized_telemetry=False)
     )
 
-    # Safely clear the collection by deleting and recreating it
     try:
-        client.delete_collection(name=COLLECTION_NAME)
+        client.delete_collection(COLLECTION_NAME)
     except Exception:
-        pass  # Collection likely doesn't exist yet
+        pass
 
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+    collection = client.get_or_create_collection(COLLECTION_NAME)
 
-    print("Storing embeddings in ChromaDB...")
-    for start in range(0, len(chunks), DB_ADD_BATCH_SIZE):
-        end = min(start + DB_ADD_BATCH_SIZE, len(chunks))
+    print("💾 Saving to database...")
+    for i in range(0, len(chunks), DB_ADD_BATCH_SIZE):
+        end = min(i + DB_ADD_BATCH_SIZE, len(chunks))
+
+        # ✅ FIXED ID GENERATION (Issue 17)
+        ids = [
+            f"{metadatas[j].get('source','unknown')}::chunk-{metadatas[j].get('chunk_index', j)}"
+            for j in range(i, end)
+        ]
+
         collection.add(
-            ids=[
-                f"{metadatas[i].get('source','unknown')}::chunk-{metadatas[i].get('chunk_index', i)}"
-                for i in range(start, end)
-            ],
-            documents=chunks[start:end],
-            embeddings=embeddings[start:end],
-            metadatas=metadatas[start:end],
+            ids=ids,
+            documents=chunks[i:end],
+            embeddings=embeddings[i:end],
+            metadatas=metadatas[i:end],
         )
-        print(f"  Stored {end}/{len(chunks)} chunks")
 
-    print(f"Successfully stored {len(chunks)} chunks at {CHROMA_DB_DIR}.")
+        print(f"  Stored {end}/{len(chunks)}")
+
+    print("✅ Data stored in ChromaDB")
+# ------------------------------------------------ #
 
 
-def build_vector_store(input_dir: str = None) -> None:
-    """Orchestrate the full ingestion pipeline from files to database."""
-    if input_dir is None:
-        input_dir = INPUT_DATA_DIR
-
-    # 1. Load and chunk all input files
-    chunks, metadatas = load_input_chunks(input_dir)
-
-    # 2. Generate embeddings for each chunk
+# ---------------- MAIN ---------------- #
+def main():
+    chunks, metadatas = load_input_chunks(INPUT_DATA_DIR)
     embeddings = compute_embeddings(chunks)
-
-    # 3. Save everything to the database
     save_to_vector_store(chunks, embeddings, metadatas)
-
-
-def main() -> None:
-    """Entry point for the embedding creation script."""
-    build_vector_store()
 
 
 if __name__ == "__main__":
     main()
+# ------------------------------------------------ #
